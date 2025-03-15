@@ -214,6 +214,9 @@ class WanVideoPipeline(BasePipeline):
         tea_cache_model_id="",
         progress_bar_cmd=tqdm,
         progress_bar_st=None,
+        slg_layers = None,
+        slg_start = 0.1,
+        slg_end = 0.9,
     ):
         # Parameter check
         height, width = self.check_resize_height_width(height, width)
@@ -261,19 +264,42 @@ class WanVideoPipeline(BasePipeline):
 
         # Denoise
         self.load_models_to_device(["dit"])
+        iterations = 0
         for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
 
+            slg_layers_local = None
+            if int(slg_start * num_inference_steps) <= iterations < int(slg_end * num_inference_steps):
+                slg_layers_local = slg_layers
+
             # Inference
-            noise_pred_posi = model_fn_wan_video(self.dit, latents, timestep=timestep, **prompt_emb_posi, **image_emb, **extra_input, **tea_cache_posi)
+            noise_pred_posi = model_fn_wan_video(
+                self.dit,
+                latents,
+                timestep=timestep,
+                **prompt_emb_posi,
+                **image_emb,
+                **extra_input,
+                **tea_cache_posi,
+            )
             if cfg_scale != 1.0:
-                noise_pred_nega = model_fn_wan_video(self.dit, latents, timestep=timestep, **prompt_emb_nega, **image_emb, **extra_input, **tea_cache_nega)
+                noise_pred_nega = model_fn_wan_video(
+                    self.dit,
+                    latents,
+                    timestep=timestep,
+                    slg_layers=slg_layers_local,
+                    **prompt_emb_nega,
+                    **image_emb,
+                    **extra_input,
+                    **tea_cache_nega,
+                )
                 noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
             else:
                 noise_pred = noise_pred_posi
 
             # Scheduler
             latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents)
+            iterations += 1
 
         # Decode
         self.load_models_to_device(['vae'])
@@ -346,6 +372,7 @@ def model_fn_wan_video(
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
     tea_cache: TeaCache = None,
+    slg_layers = None,
     **kwargs,
 ):
     t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
@@ -375,7 +402,9 @@ def model_fn_wan_video(
         x = tea_cache.update(x)
     else:
         # blocks
-        for block in dit.blocks:
+        for block_idx, block in enumerate(dit.blocks):
+            if slg_layers is not None and block_idx in slg_layers:
+                continue
             x = block(x, context, t_mod, freqs)
         if tea_cache is not None:
             tea_cache.store(x)
